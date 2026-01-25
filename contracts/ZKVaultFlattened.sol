@@ -330,7 +330,7 @@ contract ZKVault is Ownable, ReentrancyGuard {
 
     mapping(uint256 => DepositStruct) public deposits;
     mapping(uint256 => bool) public usedNullifiers;
-    mapping(address => bool) public approvedDepositers;
+    mapping(address => bool) public approvedDepositors;
     mapping(address => bool) public approvedTokens;
 
     uint256 private constant ONE = 1000000;
@@ -345,6 +345,8 @@ contract ZKVault is Ownable, ReentrancyGuard {
 
     event deposited(address depositor, address token, uint256 amountToken, uint256 amountFee);
     event withdrawn(address recipient, address token, uint256 amountToken, uint256 amountEth);
+
+    error depositFailed(uint8 errorCode);
 
     modifier onlyRelayer() {
         require(msg.sender == relayer, "not relayer");
@@ -366,31 +368,44 @@ contract ZKVault is Ownable, ReentrancyGuard {
         limits = _limits;
     }
 
+    function isDepositable(address depositor, uint256 root, address tokenAddr, uint256 amount)
+        public
+        view
+        returns (uint8)
+    {
+        if (!approvedDepositors[depositor]) return 1;
+        if (!approvedTokens[tokenAddr]) return 2;
+        if (deposits[root].amount != 0) return 3;
+        if (amount == 0) return 4;
+        return 255;
+    }
+
     function calcFee(uint256 gross, uint256 _fee) internal pure returns (uint256, uint256) {
         uint256 feeAmount = gross * _fee / ONE;
         uint256 net = gross - feeAmount;
         return (net, feeAmount);
     }
 
-    function deposit(uint256 root, address tokenAddr, uint256 amount) external notStopped nonReentrant {
-        require(approvedDepositers[msg.sender], "not approved depositor");
-        require(approvedTokens[tokenAddr], "not approved token");
-        require(deposits[root].amount == 0, "deposit exists");
-        require(amount > 0, "zero amount");
+    function deposit(address depositor, uint256 root, address tokenAddr, uint256 amount)
+        external
+        onlyRelayer
+        notStopped
+        nonReentrant
+    {
+        uint8 depositable = isDepositable(depositor, root, tokenAddr, amount);
+        if (depositable != 255) revert depositFailed(depositable);
         (uint256 netDeposit, uint256 feeAmount) = calcFee(amount, fee);
         deposits[root] = DepositStruct(tokenAddr, netDeposit);
         IERC20 token = IERC20(tokenAddr);
         uint256 balanceBefore = token.balanceOf(address(this));
-        require(token.transferFrom(msg.sender, address(this), amount), "erc20 transferFrom failed");
+        require(token.transferFrom(depositor, address(this), amount), "erc20 transferFrom failed");
         require(token.balanceOf(address(this)) - balanceBefore >= amount, "funds deposit incorrect");
         require(token.transfer(owner(), feeAmount), "erc20 transfer failed");
-        emit deposited(msg.sender, tokenAddr, netDeposit, feeAmount);
+        emit deposited(depositor, tokenAddr, netDeposit, feeAmount);
     }
 
     function isWithdrawable(IVerifier.Proof calldata proof, uint256[5] calldata inputs) public view returns (bool) {
-        if (usedNullifiers[inputs[1]]) {
-            return false;
-        }
+        if (usedNullifiers[inputs[1]]) return false;
         return IVerifier(verifier).verifyTx(proof, inputs);
     }
 
@@ -409,11 +424,7 @@ contract ZKVault is Ownable, ReentrancyGuard {
             uint256 gap = amountToRefuel - targetAccount.balance;
             require(address(this).balance >= gap, "eth balance low");
             (bool success,) = targetAccount.call{value: gap, gas: limits.gas}("");
-            if (success) {
-                return gap;
-            } else {
-                return 0;
-            }
+            return success ? gap : 0;
         }
         return 0;
     }
@@ -437,8 +448,8 @@ contract ZKVault is Ownable, ReentrancyGuard {
         stopped = _stopped;
     }
 
-    function setDepositer(address _depositer, bool _state) external onlyOwner {
-        approvedDepositers[_depositer] = _state;
+    function setDepositor(address _depositer, bool _state) external onlyOwner {
+        approvedDepositors[_depositer] = _state;
     }
 
     function setToken(address _token, bool _state) external onlyOwner {
